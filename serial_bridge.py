@@ -78,8 +78,8 @@ TOPIC_BRIDGE_STATE    = "robot/bridge/state"
 
 # Heartbeat interval to Teensy (seconds)
 HEARTBEAT_INTERVAL = 1.0
-# Teensy heartbeat timeout (seconds)
-TEENSY_HB_TIMEOUT = 3.0
+# Teensy heartbeat timeout (seconds) — generous to tolerate telemetry bursts
+TEENSY_HB_TIMEOUT = 5.0
 # Serial reconnect delay (seconds)
 RECONNECT_DELAY = 2.0
 
