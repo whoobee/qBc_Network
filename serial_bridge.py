@@ -15,8 +15,11 @@ MQTT subscriptions (Pi -> Teensy):
 MQTT publications (Teensy -> Pi):
     robot/odometry/pose         20 Hz  pose (from telemetry)
     robot/sensors/tof           20 Hz  3x TOF distances (from telemetry)
-    robot/imu/orientation       20 Hz  euler angles (from telemetry)
+    robot/sensors/lidar         ~3 Hz  36-bin polar histogram (from telemetry)
+    robot/imu/orientation       20 Hz  euler + quaternion + accel (from telemetry)
     robot/status/battery         ~20 Hz  retained (from telemetry)
+    robot/status/motors         ~10 Hz  per-motor full status (round-robin)
+    robot/joints/telemetry      ~3 Hz  per-servo full status (round-robin)
     robot/joints/status         on-demand joint status responses
     robot/safety/status         ~20 Hz  retained (from telemetry)
     robot/system/heartbeat/teensy  derived from heartbeat ACK
@@ -67,14 +70,23 @@ TOPIC_WHEELS_CMD = "robot/wheels/cmd"
 # MQTT topics — publish
 TOPIC_JOINTS_STATUS   = "robot/joints/status"
 TOPIC_JOINTS_STATE    = "robot/joints/current_state"
+TOPIC_JOINTS_TELEM    = "robot/joints/telemetry"      # per-servo full status (pos/vel/load/temp/volt/curr)
 TOPIC_ODOMETRY        = "robot/odometry/pose"
 TOPIC_TOF             = "robot/sensors/tof"
-TOPIC_IMU             = "robot/imu/orientation"
+TOPIC_LIDAR           = "robot/sensors/lidar"         # 36-bin polar histogram
+TOPIC_IMU             = "robot/imu/orientation"       # full: euler + quat + accel
 TOPIC_BATTERY         = "robot/status/battery"
+TOPIC_MOTORS          = "robot/status/motors"         # per-motor full status (vel/pos/curr/temp/fault)
 TOPIC_SAFETY_STATUS   = "robot/safety/status"
 TOPIC_HB_BRIDGE       = "robot/system/heartbeat/bridge"
 TOPIC_HB_TEENSY       = "robot/system/heartbeat/teensy"
 TOPIC_BRIDGE_STATE    = "robot/bridge/state"
+
+# Motor (wheel) APPL device ID -> canonical name
+MOTOR_DEV_TO_NAME = {
+    proto.DEV_WHEEL_LEFT:  "left",
+    proto.DEV_WHEEL_RIGHT: "right",
+}
 
 # Heartbeat interval to Teensy (seconds)
 HEARTBEAT_INTERVAL = 1.0
@@ -373,13 +385,27 @@ class SerialBridge:
         if dev == proto.DEV_SYSTEM and param == proto.PARAM_ODOM_HEADING:
             self._publish_odometry()
 
-        # IMU group — publish after yaw (last in TX cycle)
-        elif dev == proto.DEV_IMU and param == proto.PARAM_ORIENTATION_YAW:
+        # IMU full group — firmware sends euler then quat then accel; publish on ACCEL_Z
+        elif dev == proto.DEV_IMU and param == proto.PARAM_ACCEL_Z:
             self._publish_imu()
 
         # TOF group — publish after back sensor (last in TX cycle)
         elif dev == proto.DEV_TOF_BACK and param == proto.PARAM_DISTANCE_MM:
             self._publish_tof()
+
+        # Lidar polar histogram — firmware cycles bins 0..35 in 6-bin slices.
+        # Bin 35 arrives once every 6 TX ticks (~300 ms) -> publish then.
+        elif dev == proto.DEV_LIDAR and param == proto.PARAM_LIDAR_BIN_35:
+            self._publish_lidar()
+
+        # Servo full status — firmware sends pos, vel, temp, volt, curr, load (terminator)
+        elif (proto.DEV_SERVO_NECK <= dev <= proto.DEV_SERVO_LEG_BR
+              and param == proto.PARAM_LOAD):
+            self._publish_servo(dev)
+
+        # Motor (wheel) full status — firmware sends vel, pos, curr, temp, fault (terminator)
+        elif dev in MOTOR_DEV_TO_NAME and param == proto.PARAM_FAULT_CODE:
+            self._publish_motor(dev)
 
         # Battery — single value, publish immediately
         elif dev == proto.DEV_BATTERY and param == proto.PARAM_VOLTAGE:
@@ -407,6 +433,13 @@ class SerialBridge:
             "roll":  t.get((proto.DEV_IMU, proto.PARAM_ORIENTATION_ROLL), 0.0),
             "pitch": t.get((proto.DEV_IMU, proto.PARAM_ORIENTATION_PITCH), 0.0),
             "yaw":   t.get((proto.DEV_IMU, proto.PARAM_ORIENTATION_YAW), 0.0),
+            "qw":    t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_W), 0.0),
+            "qx":    t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_X), 0.0),
+            "qy":    t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_Y), 0.0),
+            "qz":    t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_Z), 0.0),
+            "ax":    t.get((proto.DEV_IMU, proto.PARAM_ACCEL_X), 0.0),
+            "ay":    t.get((proto.DEV_IMU, proto.PARAM_ACCEL_Y), 0.0),
+            "az":    t.get((proto.DEV_IMU, proto.PARAM_ACCEL_Z), 0.0),
         }), qos=0)
 
     def _publish_tof(self):
@@ -415,6 +448,60 @@ class SerialBridge:
             "left_mm":  t.get((proto.DEV_TOF_LEFT, proto.PARAM_DISTANCE_MM), 0),
             "right_mm": t.get((proto.DEV_TOF_RIGHT, proto.PARAM_DISTANCE_MM), 0),
             "back_mm":  t.get((proto.DEV_TOF_BACK, proto.PARAM_DISTANCE_MM), 0),
+        }), qos=0)
+
+    def _publish_lidar(self):
+        """Publish the full 36-bin polar histogram."""
+        t = self._telem
+        bins = [
+            int(t.get((proto.DEV_LIDAR, proto.PARAM_LIDAR_BIN_0 + i), 0))
+            for i in range(proto.LIDAR_BIN_COUNT)
+        ]
+        self._client.publish(TOPIC_LIDAR, json.dumps({
+            "bins_mm":   bins,
+            "bin_count": proto.LIDAR_BIN_COUNT,
+            "bin_deg":   proto.LIDAR_BIN_DEG,
+        }), qos=0)
+
+    def _publish_servo(self, dev_id: int):
+        """Publish a single servo's full telemetry snapshot."""
+        joint_name = proto.DEV_TO_JOINT.get(dev_id)
+        if joint_name is None:
+            return
+        j = self._joints.get(joint_name)
+        t = self._telem
+        pos_raw = int(t.get((dev_id, proto.PARAM_POSITION), 0))
+        pos_deg = _raw_to_deg(pos_raw, j["zero_position"]) if j else 0.0
+        speed_raw = int(t.get((dev_id, proto.PARAM_VELOCITY), 0))
+        # ST3215 speed register is raw steps/s — convert to deg/s for UI readability
+        speed_dps = speed_raw / STEPS_PER_DEGREE
+        self._client.publish(TOPIC_JOINTS_TELEM, json.dumps({
+            "joint_name":   joint_name,
+            "device_id":    dev_id,
+            "position_raw": pos_raw,
+            "position_deg": round(pos_deg, 2),
+            "speed_raw":    speed_raw,
+            "speed_dps":    round(speed_dps, 2),
+            "load":         t.get((dev_id, proto.PARAM_LOAD), 0.0),
+            "temperature":  t.get((dev_id, proto.PARAM_TEMPERATURE), 0.0),
+            "voltage":      t.get((dev_id, proto.PARAM_VOLTAGE), 0.0) / 10.0,  # ST3215 stores V*10
+            "current":      t.get((dev_id, proto.PARAM_CURRENT), 0.0),
+        }), qos=0)
+
+    def _publish_motor(self, dev_id: int):
+        """Publish a single wheel motor's full telemetry snapshot."""
+        name = MOTOR_DEV_TO_NAME.get(dev_id)
+        if name is None:
+            return
+        t = self._telem
+        self._client.publish(TOPIC_MOTORS, json.dumps({
+            "motor":       name,
+            "device_id":   dev_id,
+            "velocity_rpm": t.get((dev_id, proto.PARAM_VELOCITY), 0.0),
+            "position":    t.get((dev_id, proto.PARAM_POSITION), 0.0),
+            "current_a":   t.get((dev_id, proto.PARAM_CURRENT), 0.0),
+            "temperature": t.get((dev_id, proto.PARAM_TEMPERATURE), 0.0),
+            "fault_code":  int(t.get((dev_id, proto.PARAM_FAULT_CODE), 0)),
         }), qos=0)
 
     def _publish_battery(self):

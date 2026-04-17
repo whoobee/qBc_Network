@@ -113,6 +113,12 @@ PARAM_SAFETY_STATUS     = 0x40
 PARAM_HEARTBEAT         = 0x41
 PARAM_FAULT_CODE        = 0x42
 
+# Lidar polar histogram — 36 bins x 10 deg, param = PARAM_LIDAR_BIN_0 + bin_index
+PARAM_LIDAR_BIN_0       = 0x80
+PARAM_LIDAR_BIN_35      = 0xA3
+LIDAR_BIN_COUNT         = 36
+LIDAR_BIN_DEG           = 10.0
+
 # =====================================================================
 #  Error codes
 # =====================================================================
