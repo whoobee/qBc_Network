@@ -447,6 +447,7 @@ class SerialBridge:
         self._client.publish(TOPIC_TOF, json.dumps({
             "left_mm":  t.get((proto.DEV_TOF_LEFT, proto.PARAM_DISTANCE_MM), 0),
             "right_mm": t.get((proto.DEV_TOF_RIGHT, proto.PARAM_DISTANCE_MM), 0),
+            "front_mm": t.get((proto.DEV_TOF_FRONT, proto.PARAM_DISTANCE_MM), 0),
             "back_mm":  t.get((proto.DEV_TOF_BACK, proto.PARAM_DISTANCE_MM), 0),
         }), qos=0)
 
