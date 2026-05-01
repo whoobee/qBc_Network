@@ -31,6 +31,7 @@ Usage:
 import argparse
 import json
 import logging
+import math
 import signal
 import threading
 import time
@@ -55,6 +56,34 @@ DEFAULT_MQTT_PORT = 1883
 CALIBRATION_FILE = Path(__file__).parent.parent / "qBc_Servos" / "servo_calibration.json"
 
 STEPS_PER_DEGREE = 4096.0 / 360.0   # ST3215: ~11.378 steps/degree
+
+
+def _v(val, default=None):
+    """Telemetry → JSON-safe scalar.
+
+    The firmware emits IEEE-754 NaN for any sample it deems invalid /
+    low-confidence (sensor not present, dropout exceeded the hold+decay
+    window, etc.). Convert NaN to ``None`` so the resulting JSON contains
+    a clean ``null`` — every downstream consumer can branch on missing
+    data without hunting for magic-number sentinels.
+    """
+    if val is None:
+        return default
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
+def _vi(val, default=None):
+    """Same as :func:`_v` but coerces a finite value to ``int`` (e.g. mm)."""
+    f = _v(val, default=None)
+    if f is None:
+        return default
+    return int(f)
 
 # Movement profiles (matches qBc_Servos)
 MOVEMENT_PROFILES = {
@@ -422,40 +451,40 @@ class SerialBridge:
     def _publish_odometry(self):
         t = self._telem
         self._client.publish(TOPIC_ODOMETRY, json.dumps({
-            "x_mm":        t.get((proto.DEV_SYSTEM, proto.PARAM_ODOM_X), 0.0),
-            "y_mm":        t.get((proto.DEV_SYSTEM, proto.PARAM_ODOM_Y), 0.0),
-            "heading_deg": t.get((proto.DEV_SYSTEM, proto.PARAM_ODOM_HEADING), 0.0),
+            "x_mm":        _v(t.get((proto.DEV_SYSTEM, proto.PARAM_ODOM_X))),
+            "y_mm":        _v(t.get((proto.DEV_SYSTEM, proto.PARAM_ODOM_Y))),
+            "heading_deg": _v(t.get((proto.DEV_SYSTEM, proto.PARAM_ODOM_HEADING))),
         }), qos=0)
 
     def _publish_imu(self):
         t = self._telem
         self._client.publish(TOPIC_IMU, json.dumps({
-            "roll":  t.get((proto.DEV_IMU, proto.PARAM_ORIENTATION_ROLL), 0.0),
-            "pitch": t.get((proto.DEV_IMU, proto.PARAM_ORIENTATION_PITCH), 0.0),
-            "yaw":   t.get((proto.DEV_IMU, proto.PARAM_ORIENTATION_YAW), 0.0),
-            "qw":    t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_W), 0.0),
-            "qx":    t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_X), 0.0),
-            "qy":    t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_Y), 0.0),
-            "qz":    t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_Z), 0.0),
-            "ax":    t.get((proto.DEV_IMU, proto.PARAM_ACCEL_X), 0.0),
-            "ay":    t.get((proto.DEV_IMU, proto.PARAM_ACCEL_Y), 0.0),
-            "az":    t.get((proto.DEV_IMU, proto.PARAM_ACCEL_Z), 0.0),
+            "roll":  _v(t.get((proto.DEV_IMU, proto.PARAM_ORIENTATION_ROLL))),
+            "pitch": _v(t.get((proto.DEV_IMU, proto.PARAM_ORIENTATION_PITCH))),
+            "yaw":   _v(t.get((proto.DEV_IMU, proto.PARAM_ORIENTATION_YAW))),
+            "qw":    _v(t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_W))),
+            "qx":    _v(t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_X))),
+            "qy":    _v(t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_Y))),
+            "qz":    _v(t.get((proto.DEV_IMU, proto.PARAM_QUATERNION_Z))),
+            "ax":    _v(t.get((proto.DEV_IMU, proto.PARAM_ACCEL_X))),
+            "ay":    _v(t.get((proto.DEV_IMU, proto.PARAM_ACCEL_Y))),
+            "az":    _v(t.get((proto.DEV_IMU, proto.PARAM_ACCEL_Z))),
         }), qos=0)
 
     def _publish_tof(self):
         t = self._telem
         self._client.publish(TOPIC_TOF, json.dumps({
-            "left_mm":  t.get((proto.DEV_TOF_LEFT, proto.PARAM_DISTANCE_MM), 0),
-            "right_mm": t.get((proto.DEV_TOF_RIGHT, proto.PARAM_DISTANCE_MM), 0),
-            "front_mm": t.get((proto.DEV_TOF_FRONT, proto.PARAM_DISTANCE_MM), 0),
-            "back_mm":  t.get((proto.DEV_TOF_BACK, proto.PARAM_DISTANCE_MM), 0),
+            "left_mm":  _vi(t.get((proto.DEV_TOF_LEFT, proto.PARAM_DISTANCE_MM))),
+            "right_mm": _vi(t.get((proto.DEV_TOF_RIGHT, proto.PARAM_DISTANCE_MM))),
+            "front_mm": _vi(t.get((proto.DEV_TOF_FRONT, proto.PARAM_DISTANCE_MM))),
+            "back_mm":  _vi(t.get((proto.DEV_TOF_BACK, proto.PARAM_DISTANCE_MM))),
         }), qos=0)
 
     def _publish_lidar(self):
-        """Publish the full 36-bin polar histogram."""
+        """Publish the full 36-bin polar histogram (NaN bins → null)."""
         t = self._telem
         bins = [
-            int(t.get((proto.DEV_LIDAR, proto.PARAM_LIDAR_BIN_0 + i), 0))
+            _vi(t.get((proto.DEV_LIDAR, proto.PARAM_LIDAR_BIN_0 + i)))
             for i in range(proto.LIDAR_BIN_COUNT)
         ]
         self._client.publish(TOPIC_LIDAR, json.dumps({
@@ -471,22 +500,25 @@ class SerialBridge:
             return
         j = self._joints.get(joint_name)
         t = self._telem
-        pos_raw = int(t.get((dev_id, proto.PARAM_POSITION), 0))
-        pos_deg = _raw_to_deg(pos_raw, j["zero_position"]) if j else 0.0
-        speed_raw = int(t.get((dev_id, proto.PARAM_VELOCITY), 0))
+        pos_raw_v = _vi(t.get((dev_id, proto.PARAM_POSITION)))
+        pos_raw = pos_raw_v if pos_raw_v is not None else 0
+        pos_deg = _raw_to_deg(pos_raw, j["zero_position"]) if (j and pos_raw_v is not None) else None
+        speed_raw_v = _vi(t.get((dev_id, proto.PARAM_VELOCITY)))
+        speed_raw = speed_raw_v if speed_raw_v is not None else 0
         # ST3215 speed register is raw steps/s — convert to deg/s for UI readability
-        speed_dps = speed_raw / STEPS_PER_DEGREE
+        speed_dps = (speed_raw / STEPS_PER_DEGREE) if speed_raw_v is not None else None
+        voltage_raw = _v(t.get((dev_id, proto.PARAM_VOLTAGE)))
         self._client.publish(TOPIC_JOINTS_TELEM, json.dumps({
             "joint_name":   joint_name,
             "device_id":    dev_id,
-            "position_raw": pos_raw,
-            "position_deg": round(pos_deg, 2),
-            "speed_raw":    speed_raw,
-            "speed_dps":    round(speed_dps, 2),
-            "load":         t.get((dev_id, proto.PARAM_LOAD), 0.0),
-            "temperature":  t.get((dev_id, proto.PARAM_TEMPERATURE), 0.0),
-            "voltage":      t.get((dev_id, proto.PARAM_VOLTAGE), 0.0) / 10.0,  # ST3215 stores V*10
-            "current":      t.get((dev_id, proto.PARAM_CURRENT), 0.0),
+            "position_raw": pos_raw_v,
+            "position_deg": round(pos_deg, 2) if pos_deg is not None else None,
+            "speed_raw":    speed_raw_v,
+            "speed_dps":    round(speed_dps, 2) if speed_dps is not None else None,
+            "load":         _v(t.get((dev_id, proto.PARAM_LOAD))),
+            "temperature":  _v(t.get((dev_id, proto.PARAM_TEMPERATURE))),
+            "voltage":      voltage_raw / 10.0 if voltage_raw is not None else None,  # ST3215 stores V*10
+            "current":      _v(t.get((dev_id, proto.PARAM_CURRENT))),
         }), qos=0)
 
     def _publish_motor(self, dev_id: int):
@@ -498,17 +530,17 @@ class SerialBridge:
         self._client.publish(TOPIC_MOTORS, json.dumps({
             "motor":       name,
             "device_id":   dev_id,
-            "velocity_rpm": t.get((dev_id, proto.PARAM_VELOCITY), 0.0),
-            "position":    t.get((dev_id, proto.PARAM_POSITION), 0.0),
-            "current_a":   t.get((dev_id, proto.PARAM_CURRENT), 0.0),
-            "temperature": t.get((dev_id, proto.PARAM_TEMPERATURE), 0.0),
-            "fault_code":  int(t.get((dev_id, proto.PARAM_FAULT_CODE), 0)),
+            "velocity_rpm": _v(t.get((dev_id, proto.PARAM_VELOCITY))),
+            "position":    _v(t.get((dev_id, proto.PARAM_POSITION))),
+            "current_a":   _v(t.get((dev_id, proto.PARAM_CURRENT))),
+            "temperature": _v(t.get((dev_id, proto.PARAM_TEMPERATURE))),
+            "fault_code":  _vi(t.get((dev_id, proto.PARAM_FAULT_CODE))),
         }), qos=0)
 
     def _publish_battery(self):
         t = self._telem
         self._client.publish(TOPIC_BATTERY, json.dumps({
-            "voltage": t.get((proto.DEV_BATTERY, proto.PARAM_VOLTAGE), 0.0),
+            "voltage": _v(t.get((proto.DEV_BATTERY, proto.PARAM_VOLTAGE))),
         }), qos=1, retain=True)
 
     def _publish_safety(self):
