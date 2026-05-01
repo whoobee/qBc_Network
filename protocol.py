@@ -277,6 +277,23 @@ def encode_wheel_cmd(left_rpm: float, right_rpm: float) -> list[bytes]:
     ]
 
 
+def encode_wheel_position(left_delta_deg: float,
+                          right_delta_deg: float) -> list[bytes]:
+    """Encode a wheel position-delta command (one packet per wheel).
+
+    Wire semantics: each wheel advances by `delta_deg` degrees of wheel
+    rotation from its current target. The Teensy maintains a per-wheel
+    target accumulator (mod 360) so successive deltas chain naturally.
+    Sign convention: positive = both wheels move the robot forward.
+    """
+    return [
+        make_request(CMD_DRIVE, DEV_WHEEL_LEFT,  RW_WRITE, PARAM_POSITION,
+                     pack_float(left_delta_deg)),
+        make_request(CMD_DRIVE, DEV_WHEEL_RIGHT, RW_WRITE, PARAM_POSITION,
+                     pack_float(right_delta_deg)),
+    ]
+
+
 def encode_servo_move(device_id: int, position_raw: int, speed_raw: int) -> bytes:
     """Encode servo position + speed into one RequestPacket.
     value[4] = [position:uint16_LE][speed:uint16_LE]

@@ -349,16 +349,42 @@ class SerialBridge:
         self._send_to_teensy(proto.encode_read(dev_id, proto.PARAM_POSITION))
 
     def _on_wheel_cmd(self, client, userdata, msg):
-        """Handle robot/wheels/cmd messages."""
+        """Handle robot/wheels/cmd messages.
+
+        Two modes share the same topic:
+          velocity (default):  {"left_vel": rpm, "right_vel": rpm}
+                               also accepts {"mode": "velocity", ...}
+          position:            {"mode": "position",
+                                "left_delta_deg": deg, "right_delta_deg": deg}
+
+        Position-delta semantics: each wheel advances by the given
+        signed degrees of wheel rotation from its current internal
+        target. The Teensy chains successive deltas with mod-360
+        accumulation. Positive = both wheels drive the robot forward.
+        """
         try:
             data = json.loads(msg.payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
 
-        left = float(data.get("left_vel", 0.0))
-        right = float(data.get("right_vel", 0.0))
-        for pkt in proto.encode_wheel_cmd(left, right):
-            self._send_to_teensy(pkt)
+        mode = (data.get("mode") or "").lower()
+        if not mode:
+            # Backward compat: infer mode from keys present.
+            mode = "position" if ("left_delta_deg" in data
+                                  or "right_delta_deg" in data) else "velocity"
+
+        if mode == "position":
+            left = float(data.get("left_delta_deg", 0.0))
+            right = float(data.get("right_delta_deg", 0.0))
+            for pkt in proto.encode_wheel_position(left, right):
+                self._send_to_teensy(pkt)
+        elif mode == "velocity":
+            left = float(data.get("left_vel", 0.0))
+            right = float(data.get("right_vel", 0.0))
+            for pkt in proto.encode_wheel_cmd(left, right):
+                self._send_to_teensy(pkt)
+        else:
+            logger.warning("Unknown wheel cmd mode: %r", mode)
 
     # ------------------------------------------------------------------
     #  Teensy -> MQTT  (incoming serial dispatch)
@@ -527,14 +553,19 @@ class SerialBridge:
         if name is None:
             return
         t = self._telem
+        vel = _v(t.get((dev_id, proto.PARAM_VELOCITY)))
+        # `moving` lets BT consumers (e.g. DriveDistance) detect when a
+        # position-mode move has settled without polling the encoder.
+        moving = (vel is not None and abs(vel) > 1.0)
         self._client.publish(TOPIC_MOTORS, json.dumps({
             "motor":       name,
             "device_id":   dev_id,
-            "velocity_rpm": _v(t.get((dev_id, proto.PARAM_VELOCITY))),
+            "velocity_rpm": vel,
             "position":    _v(t.get((dev_id, proto.PARAM_POSITION))),
             "current_a":   _v(t.get((dev_id, proto.PARAM_CURRENT))),
             "temperature": _v(t.get((dev_id, proto.PARAM_TEMPERATURE))),
             "fault_code":  _vi(t.get((dev_id, proto.PARAM_FAULT_CODE))),
+            "moving":      moving,
         }), qos=0)
 
     def _publish_battery(self):
